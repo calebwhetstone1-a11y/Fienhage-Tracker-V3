@@ -87,7 +87,7 @@ def merge_comma_separated(existing_value, new_value):
 
 
 def normalize_quantity_text(qty_raw):
-    qty_raw = qty_raw.strip()
+    qty_raw = str(qty_raw).strip()
 
     if "," in qty_raw and "." in qty_raw:
         if qty_raw.rfind(",") > qty_raw.rfind("."):
@@ -182,7 +182,106 @@ def preprocess_for_ocr(img):
 
 
 def line_looks_like_item_row(line):
-    return re.search(r"\b\d{4}\s*-\s*\d{4}\b", line) is not None
+    return re.search(r"\b\d{4}\s*[-–—]\s*\d{4}\b", line) is not None
+
+
+def extract_item_and_remainder(line):
+    """
+    More forgiving item-number extraction:
+    - allows -, en dash, em dash
+    - allows leading text/noise before the part number
+    - does not require exact spacing after item number
+    """
+    item_match = re.search(r"(\d{4}\s*[-–—]\s*\d{4})", line)
+    if not item_match:
+        return None, None
+
+    item_no = re.sub(r"\s*[-–—]\s*", "-", item_match.group(1).strip())
+    remainder = line[item_match.end():].strip()
+    return item_no, remainder
+
+
+def parse_quantity_and_description(remainder):
+    """
+    Try a few increasingly forgiving patterns to recover description + quantity.
+    """
+
+    qty_match = re.search(
+        r"(.+?)\s+([\d.,]+)\s+(piece|stück|pcs?|bundle|kg|pc|roll|rolle|set|sets|meter|metre|each|einh\.?|stk|stck|m)\b",
+        remainder,
+        re.IGNORECASE,
+    )
+    if qty_match:
+        description = qty_match.group(1).strip()
+        qty_raw = qty_match.group(2).strip()
+        unit = qty_match.group(3).strip().lower()
+        try:
+            quantity = normalize_quantity_text(qty_raw)
+            return description, quantity, unit
+        except Exception:
+            pass
+
+    fallback_match = re.search(
+        r"(.+?)\s+([\d.,]+)(?:\s+\S+)?$",
+        remainder,
+        re.IGNORECASE,
+    )
+    if fallback_match:
+        description = fallback_match.group(1).strip()
+        qty_raw = fallback_match.group(2).strip()
+        unit = "auto"
+        try:
+            quantity = normalize_quantity_text(qty_raw)
+            return description, quantity, unit
+        except Exception:
+            pass
+
+    fallback_match_2 = re.search(
+        r"(.+?)\s+([\d.,]+)(?:\s+[A-Za-zÄÖÜäöü\.]+)?$",
+        remainder,
+        re.IGNORECASE,
+    )
+    if fallback_match_2:
+        description = fallback_match_2.group(1).strip()
+        qty_raw = fallback_match_2.group(2).strip()
+        unit = "fallback"
+        try:
+            quantity = normalize_quantity_text(qty_raw)
+            return description, quantity, unit
+        except Exception:
+            pass
+
+    return None, None, None
+
+
+def clean_ocr_line(line):
+    if line is None:
+        return ""
+
+    line = str(line).replace("\xa0", " ")
+    line = line.replace("|", " ")
+    line = line.replace("—", "-").replace("–", "-")
+    line = re.sub(r"[ \t]+", " ", line)
+    line = re.sub(r"\s*-\s*", "-", line)
+    return line.strip()
+
+
+def classify_ocr_line(line):
+    line_lower = line.lower()
+
+    if not line:
+        return "blank"
+    if is_table_header(line):
+        return "table_header"
+    if is_end_of_table(line):
+        return "end_of_table"
+    if extract_colli_number(line):
+        return "colli_line"
+    if line_looks_like_item_row(line):
+        return "possible_item_row"
+    if "truck" in line_lower:
+        return "document_line"
+    return "other"
 
 
 def load_pages_from_upload(uploaded_file):
@@ -207,6 +306,10 @@ def load_pages_from_upload(uploaded_file):
 def process_delivery_files(delivery_files):
     all_items = []
     preview_images = []
+    ocr_text_records = []
+    cleaned_ocr_records = []
+    classified_line_records = []
+    skipped_line_records = []
 
     progress = st.progress(0, text="Starting OCR processing...")
     total_files = len(delivery_files)
@@ -219,7 +322,6 @@ def process_delivery_files(delivery_files):
 
         pages = load_pages_from_upload(uploaded_file)
 
-        # Allows later pages to continue a table even if the header is missing
         table_started_in_previous_page = False
 
         for page_index, page_img in enumerate(pages, start=1):
@@ -231,6 +333,14 @@ def process_delivery_files(delivery_files):
                 config="--psm 6 -c preserve_interword_spaces=1"
             )
 
+            ocr_text_records.append(
+                {
+                    "SourceFile": uploaded_file.name,
+                    "PageNumber": page_index,
+                    "OCR_Text": text,
+                }
+            )
+
             document_number = extract_document_number(text)
 
             lines = text.split("\n")
@@ -238,9 +348,33 @@ def process_delivery_files(delivery_files):
             current_colli = ""
             page_item_count = 0
 
-            for line in lines:
-                line = " ".join(line.split())
-                line_lower = line.lower()
+            for line_number, line in enumerate(lines, start=1):
+                original_line = line
+                cleaned_line = clean_ocr_line(line)
+
+                classified_line_records.append(
+                    {
+                        "SourceFile": uploaded_file.name,
+                        "PageNumber": page_index,
+                        "LineNumber": line_number,
+                        "LineType": classify_ocr_line(cleaned_line),
+                        "RawLine": original_line,
+                        "CleanedLine": cleaned_line,
+                    }
+                )
+
+                if cleaned_line:
+                    cleaned_ocr_records.append(
+                        {
+                            "SourceFile": uploaded_file.name,
+                            "PageNumber": page_index,
+                            "LineNumber": line_number,
+                            "RawLine": original_line,
+                            "CleanedLine": cleaned_line,
+                        }
+                    )
+
+                line = cleaned_line
 
                 if not line:
                     continue
@@ -249,12 +383,10 @@ def process_delivery_files(delivery_files):
                 if detected_colli:
                     current_colli = detected_colli
 
-                # Normal table start
                 if is_table_header(line):
                     capture = True
                     continue
 
-                # If this page is continuing the table, let an item-looking row start capture
                 if not capture and line_looks_like_item_row(line):
                     capture = True
 
@@ -274,54 +406,36 @@ def process_delivery_files(delivery_files):
                 if not line:
                     continue
 
-                # More forgiving item number match
-                item_match = re.search(r"^\s*(\d{4}\s*-\s*\d{4})\s+(.+)$", line)
-                if not item_match:
+                item_no, remainder = extract_item_and_remainder(line)
+                if not item_no:
+                    if re.search(r"\d{4}", line):
+                        skipped_line_records.append(
+                            {
+                                "SourceFile": uploaded_file.name,
+                                "PageNumber": page_index,
+                                "LineNumber": line_number,
+                                "Reason": "No item match",
+                                "Line": original_line,
+                                "CleanedLine": line,
+                            }
+                        )
                     continue
 
-                item_no = re.sub(r"\s*-\s*", "-", item_match.group(1).strip())
-                remainder = item_match.group(2).strip()
-
-                description = None
-                quantity = None
-                unit = None
-
-                # Pass 1: known units
-                qty_match = re.search(
-                    r"(.+?)\s+([\d.,]+)\s+(piece|stück|pcs?|bundle|kg|pc|roll|rolle|set|sets|meter|metre|each|einh\.?)\b",
-                    remainder,
-                    re.IGNORECASE,
-                )
-
-                if qty_match:
-                    description = qty_match.group(1).strip()
-                    qty_raw = qty_match.group(2).strip()
-                    unit = qty_match.group(3).strip().lower()
-
-                    try:
-                        quantity = normalize_quantity_text(qty_raw)
-                    except Exception:
-                        quantity = None
-
-                # Pass 2: fallback if unit is missing or OCR-read badly
-                if quantity is None:
-                    fallback_match = re.search(
-                        r"(.+?)\s+([\d.,]+)(?:\s+[A-Za-zÄÖÜäöü\.]+)?$",
-                        remainder,
-                        re.IGNORECASE,
-                    )
-
-                    if fallback_match:
-                        description = fallback_match.group(1).strip()
-                        qty_raw = fallback_match.group(2).strip()
-                        unit = "fallback"
-
-                        try:
-                            quantity = normalize_quantity_text(qty_raw)
-                        except Exception:
-                            quantity = None
+                description, quantity, unit = parse_quantity_and_description(remainder)
 
                 if quantity is None or description is None:
+                    skipped_line_records.append(
+                        {
+                            "SourceFile": uploaded_file.name,
+                            "PageNumber": page_index,
+                            "LineNumber": line_number,
+                            "Reason": "No quantity/description parse",
+                            "Line": original_line,
+                            "CleanedLine": line,
+                            "ItemNoGuess": item_no,
+                            "Remainder": remainder,
+                        }
+                    )
                     continue
 
                 all_items.append(
@@ -334,17 +448,21 @@ def process_delivery_files(delivery_files):
                         "DocumentNumber": document_number,
                         "SourceFile": uploaded_file.name,
                         "PageNumber": page_index,
+                        "LineNumber": line_number,
                     }
                 )
 
                 page_item_count += 1
 
-            # If this page had valid item rows, allow next page to continue table automatically
             table_started_in_previous_page = page_item_count > 0
 
     progress.progress(100, text="OCR processing complete.")
 
     raw_df = pd.DataFrame(all_items)
+    ocr_text_df = pd.DataFrame(ocr_text_records)
+    cleaned_ocr_df = pd.DataFrame(cleaned_ocr_records)
+    classified_lines_df = pd.DataFrame(classified_line_records)
+    skipped_lines_df = pd.DataFrame(skipped_line_records)
 
     if raw_df.empty:
         summary_df = pd.DataFrame(columns=["ItemNo", "Description", "Quantity", "PalletList", "DocumentList"])
@@ -362,7 +480,7 @@ def process_delivery_files(delivery_files):
 
         summary_df = summary_df[["ItemNo", "Description", "Quantity", "PalletList", "DocumentList"]]
 
-    return raw_df, summary_df, preview_images
+    return raw_df, summary_df, preview_images, ocr_text_df, cleaned_ocr_df, classified_lines_df, skipped_lines_df
 
 
 def build_tracker_lookup(wb):
@@ -486,6 +604,7 @@ def update_tracker_workbook(wb, summary_df, raw_df):
         qty = row["Quantity"] if "Quantity" in raw_df.columns else ""
         source_file = row["SourceFile"] if "SourceFile" in raw_df.columns else ""
         page_number = row["PageNumber"] if "PageNumber" in raw_df.columns else ""
+        line_number = row["LineNumber"] if "LineNumber" in raw_df.columns else ""
         colli_no = row["ColliNo"] if "ColliNo" in raw_df.columns else ""
         document_number = row["DocumentNumber"] if "DocumentNumber" in raw_df.columns else ""
 
@@ -500,6 +619,7 @@ def update_tracker_workbook(wb, summary_df, raw_df):
                     "DocumentNumber": document_number,
                     "SourceFile": source_file,
                     "PageNumber": page_number,
+                    "LineNumber": line_number,
                 }
             )
 
@@ -508,7 +628,7 @@ def update_tracker_workbook(wb, summary_df, raw_df):
     if not unmatched_df.empty:
         unmatched_df = (
             unmatched_df.groupby(
-                ["Item #", "Normalized Item #", "Description", "ColliNo", "DocumentNumber", "SourceFile", "PageNumber"],
+                ["Item #", "Normalized Item #", "Description", "ColliNo", "DocumentNumber", "SourceFile", "PageNumber", "LineNumber"],
                 as_index=False,
             )["Quantity"].sum()
         )
@@ -580,21 +700,41 @@ if process_clicked:
     st.session_state.results = {}
 
     with st.spinner("Running OCR and updating tracker..."):
-        raw_df, summary_df, preview_images = process_delivery_files(delivery_files)
+        raw_df, summary_df, preview_images, ocr_text_df, cleaned_ocr_df, classified_lines_df, skipped_lines_df = process_delivery_files(delivery_files)
 
         tracker_bytes = tracker_file.getvalue()
         wb = load_workbook(BytesIO(tracker_bytes))
 
         wb, matched_df, not_found_df, unmatched_df = update_tracker_workbook(wb, summary_df, raw_df)
 
-        updated_tracker_bytes = workbook_to_bytes(wb)
-
         ocr_results_bytes = dataframe_to_excel_bytes(
             {
-                "Raw_OCR_Data": raw_df if not raw_df.empty else pd.DataFrame(),
+                "Parsed_OCR_Rows": raw_df if not raw_df.empty else pd.DataFrame(),
                 "Summarized_Totals": summary_df if not summary_df.empty else pd.DataFrame(),
             }
         )
+
+        parsed_rows_export_bytes = dataframe_to_excel_bytes(
+            {
+                "Parsed_OCR_Rows": raw_df if not raw_df.empty else pd.DataFrame()
+            }
+        )
+
+        ocr_text_export_bytes = dataframe_to_excel_bytes(
+            {
+                "OCR_Raw_Text": ocr_text_df if not ocr_text_df.empty else pd.DataFrame(),
+                "OCR_Cleaned_Lines": cleaned_ocr_df if not cleaned_ocr_df.empty else pd.DataFrame(),
+                "OCR_Classified_Lines": classified_lines_df if not classified_lines_df.empty else pd.DataFrame(),
+            }
+        )
+
+        skipped_lines_export_bytes = dataframe_to_excel_bytes(
+            {
+                "Skipped_Lines": skipped_lines_df if not skipped_lines_df.empty else pd.DataFrame()
+            }
+        )
+
+        updated_tracker_bytes = workbook_to_bytes(wb)
 
         unmatched_export_bytes = None
         if unmatched_df is not None and not unmatched_df.empty:
@@ -609,6 +749,13 @@ if process_clicked:
         "preview_images": preview_images,
         "updated_tracker_bytes": updated_tracker_bytes,
         "ocr_results_bytes": ocr_results_bytes,
+        "parsed_rows_export_bytes": parsed_rows_export_bytes,
+        "ocr_text_export_bytes": ocr_text_export_bytes,
+        "ocr_text_df": ocr_text_df,
+        "cleaned_ocr_df": cleaned_ocr_df,
+        "classified_lines_df": classified_lines_df,
+        "skipped_lines_df": skipped_lines_df,
+        "skipped_lines_export_bytes": skipped_lines_export_bytes,
         "unmatched_export_bytes": unmatched_export_bytes,
     }
 
@@ -627,6 +774,13 @@ if st.session_state.processed:
     preview_images = results["preview_images"]
     updated_tracker_bytes = results["updated_tracker_bytes"]
     ocr_results_bytes = results["ocr_results_bytes"]
+    parsed_rows_export_bytes = results["parsed_rows_export_bytes"]
+    ocr_text_export_bytes = results["ocr_text_export_bytes"]
+    ocr_text_df = results["ocr_text_df"]
+    cleaned_ocr_df = results["cleaned_ocr_df"]
+    classified_lines_df = results["classified_lines_df"]
+    skipped_lines_df = results["skipped_lines_df"]
+    skipped_lines_export_bytes = results["skipped_lines_export_bytes"]
     unmatched_export_bytes = results["unmatched_export_bytes"]
 
     st.success("Processing complete.")
@@ -646,6 +800,24 @@ if st.session_state.processed:
     with col2:
         st.subheader("Matched Rows")
         st.dataframe(matched_df, use_container_width=True)
+
+    with st.expander("Parsed OCR Rows Preview", expanded=False):
+        st.dataframe(raw_df, use_container_width=True)
+
+    with st.expander("OCR Raw Text Preview", expanded=False):
+        st.dataframe(ocr_text_df, use_container_width=True)
+
+    with st.expander("Cleaned OCR Lines Preview", expanded=False):
+        st.dataframe(cleaned_ocr_df, use_container_width=True)
+
+    with st.expander("Classified OCR Lines Preview", expanded=False):
+        st.dataframe(classified_lines_df, use_container_width=True)
+
+    with st.expander("Skipped Lines Preview", expanded=False):
+        if not skipped_lines_df.empty:
+            st.dataframe(skipped_lines_df, use_container_width=True)
+        else:
+            st.info("No skipped lines were recorded.")
 
     st.subheader("Unmatched Items")
     if unmatched_df is not None and not unmatched_df.empty:
@@ -668,6 +840,27 @@ if st.session_state.processed:
         label="Download OCR Results",
         data=ocr_results_bytes,
         file_name="OCR_Results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.download_button(
+        label="Download Parsed OCR Rows",
+        data=parsed_rows_export_bytes,
+        file_name="Parsed_OCR_Rows.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.download_button(
+        label="Download OCR Raw Text",
+        data=ocr_text_export_bytes,
+        file_name="OCR_Raw_Text.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.download_button(
+        label="Download Skipped Lines",
+        data=skipped_lines_export_bytes,
+        file_name="Skipped_Lines.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
